@@ -7,7 +7,7 @@
     支持:
     1. 创建 Python 虚拟环境
     2. 安装 plyer 依赖
-    3. 部署通知发送脚本
+    3. 部署通知发送脚本（支持前台窗口检测，离开 CLI 才弹窗）
     4. 安装 Claude Code Skill
     5. 配置 settings.json hooks
 .NOTES
@@ -67,29 +67,117 @@ if (Test-Path $repoScript) {
     Copy-Item $repoScript $NOTIFY_SCRIPT -Force
     Write-Host "  OK 从仓库复制脚本到: $NOTIFY_SCRIPT" -ForegroundColor Green
 } else {
-    # 内嵌生成
+    # 内嵌生成（fallback）
     $scriptContent = @'
 import sys
+import ctypes
+import subprocess
 import argparse
-from plyer import notification
 
 
-def send_notify(title: str, message: str) -> None:
-    notification.notify(
-        title=title,
-        message=message,
-        timeout=5,
-    )
+TYPE_CONFIG = {
+    "permission": {
+        "title": "Claude Code — 权限确认",
+        "timeout": 12,
+    },
+    "notification": {
+        "title": "Claude Code — 等待输入",
+        "timeout": 10,
+    },
+    "stop": {
+        "title": "Claude Code — 任务完成",
+        "timeout": 10,
+    },
+    "default": {
+        "title": "Claude Code",
+        "timeout": 10,
+    },
+}
+
+
+def get_active_window_title() -> str:
+    try:
+        hwnd = ctypes.windll.user32.GetForegroundWindow()
+        length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+        buf = ctypes.create_unicode_buffer(length + 1)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+        return buf.value
+    except Exception:
+        return ""
+
+
+def is_claude_active() -> bool:
+    title = get_active_window_title().lower()
+    claude_keywords = [
+        "claude code", "claude", ".claude",
+    ]
+    terminal_keywords = [
+        "powershell", "cmd.exe", "windows terminal",
+        "terminal", "tabby", "wezterm", "alacritty",
+    ]
+    for kw in claude_keywords:
+        if kw in title:
+            return True
+    for kw in terminal_keywords:
+        if kw in title:
+            return True
+    return False
+
+
+def notify_plyer(title: str, message: str, timeout: int) -> bool:
+    try:
+        from plyer import notification
+        notification.notify(
+            title=title,
+            message=message,
+            app_name="Claude Code",
+            timeout=timeout,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def notify_powershell(title: str, message: str) -> bool:
+    try:
+        ps_script = (
+            "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications,"
+            " ContentType = WindowsRuntime] > $null\n"
+            "$template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent(\n"
+            "    [Windows.UI.Notifications.ToastTemplateType]::ToastText02\n"
+            ")\n"
+            '$texts = $template.GetElementsByTagName("text")\n'
+            f"$texts.Item(0).AppendChild($template.CreateTextNode('{title}')) > $null\n"
+            f"$texts.Item(1).AppendChild($template.CreateTextNode('{message}')) > $null\n"
+            "$toast = [Windows.UI.Notifications.ToastNotification]::new($template)\n"
+            '$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("Claude Code")\n'
+            "$notifier.Show($toast)\n"
+        )
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True, timeout=10,
+        )
+        return True
+    except Exception:
+        return False
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Send desktop notification.")
-    parser.add_argument("message", nargs="+", help="Notification message")
-    parser.add_argument("--title", default="Claude Code", help="Notification title")
+    parser = argparse.ArgumentParser(description="Claude Code 桌面通知工具")
+    parser.add_argument("message", nargs="+", help="通知正文")
+    parser.add_argument("--type", default="default",
+                        choices=["permission", "notification", "stop", "default"],
+                        help="通知类型，决定标题和超时")
     args = parser.parse_args()
 
+    if is_claude_active():
+        return
+
+    config = TYPE_CONFIG.get(args.type, TYPE_CONFIG["default"])
     message = " ".join(args.message)
-    send_notify(args.title, message)
+
+    if not notify_plyer(config["title"], message, config["timeout"]):
+        notify_powershell(config["title"], message)
 
 
 if __name__ == "__main__":
@@ -113,9 +201,9 @@ if (Test-Path $repoSkill) {
 # Step 6: 配置 hooks
 Write-Host "[6/6] 配置 settings.json hooks..." -ForegroundColor Yellow
 
-$HOOK_CMD_STOP = "$PYTHON_EXE $NOTIFY_SCRIPT Claude Code 已完成本次任务"
-$HOOK_CMD_PERMISSION = "$PYTHON_EXE $NOTIFY_SCRIPT 需要授权：请回到 Claude Code 确认操作"
-$HOOK_CMD_NOTIFICATION = "$PYTHON_EXE $NOTIFY_SCRIPT Claude Code 等待你的输入或选择"
+$HOOK_CMD_STOP = "$PYTHON_EXE $NOTIFY_SCRIPT --type stop 本次任务处理完毕，可以回来查看结果了"
+$HOOK_CMD_PERMISSION = "$PYTHON_EXE $NOTIFY_SCRIPT --type permission 需要你的授权以继续执行操作 — 请回到 Claude Code 窗口确认"
+$HOOK_CMD_NOTIFICATION = "$PYTHON_EXE $NOTIFY_SCRIPT --type notification 处理已暂停，需要你继续输入或做出选择"
 $PERMISSION_MATCHER = "Task|TaskOutput|Bash|Glob|Grep|ExitPlanMode|Read|Edit|Write|NotebookEdit|WebFetch|WebSearch|AskUserQuestion|Skill|EnterPlanMode"
 $NOTIFICATION_MATCHER = "permission_prompt|idle_prompt|auth_success|elicitation_dialog"
 
@@ -168,8 +256,8 @@ Write-Host "  OK settings.json 已更新" -ForegroundColor Green
 
 # 测试通知
 Write-Host ""
-Write-Host "测试通知..." -ForegroundColor Yellow
-& $PYTHON_EXE $NOTIFY_SCRIPT "安装成功！Claude Code 桌面通知已就绪" --title "Claude Code"
+Write-Host "测试通知（只有前台窗口不是终端/Claude Code 时才能看到）..." -ForegroundColor Yellow
+& $PYTHON_EXE $NOTIFY_SCRIPT --type default "安装成功！Claude Code 桌面通知已就绪"
 
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan
@@ -180,6 +268,8 @@ Write-Host "已配置以下通知场景:" -ForegroundColor White
 Write-Host "  * Stop             - 任务完成时提醒" -ForegroundColor Gray
 Write-Host "  * PermissionRequest - 需要授权时提醒" -ForegroundColor Gray
 Write-Host "  * Notification     - 等待输入时提醒" -ForegroundColor Gray
+Write-Host ""
+Write-Host "特性：检测到你正在看 Claude Code / 终端时不弹窗，切走才提醒" -ForegroundColor White
 Write-Host ""
 Write-Host "输入 /desktop-notification 管理通知设置" -ForegroundColor White
 Write-Host ""
